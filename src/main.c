@@ -51,7 +51,7 @@
 #define WM_LIVE_DONE    (WM_APP + 3)
 
 enum { HOTKEY_TOGGLE = 1, HOTKEY_ESC = 2 };
-enum { TIMER_HIDE = 1, TIMER_RESTORE_CLIP, TIMER_TICK, TIMER_LIVE_WATCHDOG };
+enum { TIMER_HIDE = 1, TIMER_RESTORE_CLIP, TIMER_TICK, TIMER_LIVE_WATCHDOG, TIMER_STOP_TAIL };
 enum { IDM_SETTINGS = 100, IDM_RELOAD, IDM_AUTOSTART, IDM_EXIT };
 enum { ST_IDLE, ST_RECORDING, ST_TRANSCRIBING };
 enum { LIVE_IDLE, LIVE_RECORDING, LIVE_FINISHING };
@@ -62,6 +62,7 @@ enum { LIVE_IDLE, LIVE_RECORDING, LIVE_FINISHING };
 #define MAX_SECONDS    360              // 6 minutes max; then recording stops and is transcribed as usual
 #define MIN_SAMPLES    (SAMPLE_RATE * 3 / 10)
 #define NUM_BARS       56
+#define STOP_TAIL_MS   300              // keeps recording after the stop key: the last words are still in the audio driver
 
 // While idle the access token is kept fresh; after a failure (e.g. offline) it is retried this often
 #define TOKEN_RETRY_MS      (30 * 1000)
@@ -115,6 +116,7 @@ static int g_hotkeyOk;
 static int g_state = ST_IDLE;
 static HWND g_target;
 static DWORD g_recordStart, g_stopTick;
+static int g_stopping; // the stop key was pressed; recording ends when TIMER_STOP_TAIL fires
 static int g_useLive, g_waitLive;
 
 // Recording
@@ -1711,6 +1713,31 @@ static void StartRestJob(int liveFailed)
     CloseHandle(CreateThread(NULL, 0, TranscribeThread, job, 0, NULL));
 }
 
+static void FinishRecording(void)
+{
+    KillTimer(g_main, TIMER_STOP_TAIL);
+    g_stopping = 0;
+    StopRecording();
+    EndRecordingUi();
+    if (g_pcmLen < MIN_SAMPLES) {
+        if (g_useLive) LiveSetPhase(LIVE_IDLE, 0);
+        g_state = ST_IDLE;
+        ShowOverlay(L"Too short, not sent", 0);
+        HideLater(1000);
+        return;
+    }
+    g_state = ST_TRANSCRIBING;
+    ShowOverlay(L"… Transcribing", 0);
+    if (g_useLive) {
+        g_waitLive = 1;
+        // In case the live thread is stuck (e.g. a dead connection), fall back on our own
+        SetTimer(g_main, TIMER_LIVE_WATCHDOG, 30000 + (UINT)(g_pcmLen / SAMPLE_RATE) * 200, NULL);
+        LiveSetPhase(LIVE_FINISHING, 0);
+    } else {
+        StartRestJob(0);
+    }
+}
+
 static void OnToggle(void)
 {
     if (g_state == ST_IDLE) {
@@ -1735,27 +1762,10 @@ static void OnToggle(void)
         RegisterHotKey(g_main, HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE);
         SetTimer(g_main, TIMER_TICK, 250, NULL);
         PlaceOverlay();
-    } else if (g_state == ST_RECORDING) {
-        StopRecording();
-        EndRecordingUi();
+    } else if (g_state == ST_RECORDING && !g_stopping) {
+        g_stopping = 1;
         g_stopTick = GetTickCount();
-        if (g_pcmLen < MIN_SAMPLES) {
-            if (g_useLive) LiveSetPhase(LIVE_IDLE, 0);
-            g_state = ST_IDLE;
-            ShowOverlay(L"Too short, not sent", 0);
-            HideLater(1000);
-            return;
-        }
-        g_state = ST_TRANSCRIBING;
-        ShowOverlay(L"… Transcribing", 0);
-        if (g_useLive) {
-            g_waitLive = 1;
-            // In case the live thread is stuck (e.g. a dead connection), fall back on our own
-            SetTimer(g_main, TIMER_LIVE_WATCHDOG, 30000 + (UINT)(g_pcmLen / SAMPLE_RATE) * 200, NULL);
-            LiveSetPhase(LIVE_FINISHING, 0);
-        } else {
-            StartRestJob(0);
-        }
+        SetTimer(g_main, TIMER_STOP_TAIL, STOP_TAIL_MS, NULL);
     }
     // A hotkey press while transcribing does nothing
 }
@@ -1763,6 +1773,8 @@ static void OnToggle(void)
 static void OnCancel(void)
 {
     if (g_state != ST_RECORDING) return;
+    KillTimer(g_main, TIMER_STOP_TAIL);
+    g_stopping = 0;
     StopRecording();
     EndRecordingUi();
     if (g_useLive) LiveSetPhase(LIVE_IDLE, 0);
@@ -1925,6 +1937,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             RestoreClipboard();
         } else if (w == TIMER_TICK) {
             InvalidateRect(g_overlay, NULL, FALSE);
+        } else if (w == TIMER_STOP_TAIL) {
+            if (g_stopping) FinishRecording();
         } else if (w == TIMER_LIVE_WATCHDOG) {
             OnLiveWatchdog();
         }
