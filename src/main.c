@@ -62,6 +62,7 @@ enum { LIVE_IDLE, LIVE_RECORDING, LIVE_FINISHING };
 #define MAX_SECONDS    360              // 6 minutes max; then recording stops and is transcribed as usual
 #define MIN_SAMPLES    (SAMPLE_RATE * 3 / 10)
 #define NUM_BARS       56
+#define REST_MODEL     L"gemini-3.5-flash" // non-streaming transcription (API key, or LiveModel left empty)
 #define STOP_TAIL_MS   300              // keeps recording after the stop key: the last words are still in the audio driver
 
 // While idle the access token is kept fresh; after a failure (e.g. offline) it is retried this often
@@ -69,8 +70,8 @@ enum { LIVE_IDLE, LIVE_RECORDING, LIVE_FINISHING };
 
 typedef struct { char *p; size_t len, cap; } Buf;
 typedef struct { UINT fmt; HGLOBAL data; } ClipItem;
-typedef struct { char *body; size_t bodyLen; wchar_t model[128], fallback[128]; int liveFailed; } Job;
-typedef struct { wchar_t *text, *error; int fallback; } JobResult;
+typedef struct { char *body; size_t bodyLen; } Job;
+typedef struct { wchar_t *text, *error; } JobResult;
 
 // Everything the live thread needs, copied from the settings under g_liveLock
 typedef struct {
@@ -103,8 +104,6 @@ static wchar_t g_location[64];
 static wchar_t g_liveModel[128];
 static wchar_t g_liveMode[32];
 static wchar_t g_languages[256];
-static wchar_t g_model[128];
-static wchar_t g_fallbackModel[128];
 static wchar_t g_proxy[256];
 static wchar_t g_vocabulary[4096];
 static wchar_t g_prompt[8192];
@@ -426,16 +425,12 @@ static void WriteDefaultIni(const wchar_t *path)
         L"; Vertex AI location\r\n"
         L"Location=global\r\n"
         L"; Streaming transcription model (Live API, service account only); the text arrives about a second after you\r\n"
-        L"; stop. Leave empty to always send the whole recording to Model instead\r\n"
+        L"; stop. Leave empty to send the whole recording when you stop instead (2-3 s)\r\n"
         L"LiveModel=gemini-3.5-transcribe-live\r\n"
         L"; SMART removes filler words and adds punctuation; VERBATIM keeps everything as spoken\r\n"
         L"LiveMode=SMART\r\n"
         L"; Languages you speak, comma separated\r\n"
         L"Languages=zh-CN,en-US\r\n"
-        L"; Model for non-streaming transcription (API key, or when the live session fails); FallbackModel is tried\r\n"
-        L"; when Model returns an error (quota, model not found, ...)\r\n"
-        L"Model=gemini-3.5-flash\r\n"
-        L"FallbackModel=gemini-3.5-flash-lite\r\n"
         L"; Global hotkey to start/stop recording, e.g. Ctrl+Alt+Space, Ctrl+Shift+H, F9. Esc cancels while recording\r\n"
         L"Hotkey=Ctrl+Alt+Space\r\n"
         L"; Names, product names and terms you often say, comma separated, to help recognition\r\n"
@@ -471,8 +466,6 @@ static void LoadConfig(void)
     GetPrivateProfileStringW(L"dictation", L"LiveModel", L"gemini-3.5-transcribe-live", g_liveModel, 128, ini);
     GetPrivateProfileStringW(L"dictation", L"LiveMode", L"SMART", g_liveMode, 32, ini);
     GetPrivateProfileStringW(L"dictation", L"Languages", L"zh-CN,en-US", g_languages, 256, ini);
-    GetPrivateProfileStringW(L"dictation", L"Model", L"gemini-3.5-flash", g_model, 128, ini);
-    GetPrivateProfileStringW(L"dictation", L"FallbackModel", L"", g_fallbackModel, 128, ini);
     GetPrivateProfileStringW(L"dictation", L"Proxy", L"", g_proxy, 256, ini);
     GetPrivateProfileStringW(L"dictation", L"Vocabulary", L"", g_vocabulary, 4096, ini);
     GetPrivateProfileStringW(L"dictation", L"Prompt", L"", g_prompt, 8192, ini);
@@ -484,8 +477,6 @@ static void LoadConfig(void)
     if (!g_location[0]) wcscpy(g_location, L"global");
     TrimW(g_liveModel);
     TrimW(g_liveMode);
-    TrimW(g_model);
-    TrimW(g_fallbackModel);
     TrimW(g_proxy);
     TrimW(g_genConfig);
     LiveUpdateConfig();
@@ -1101,8 +1092,6 @@ static Job *BuildJob(void)
     if (!job) { free(body.p); return NULL; }
     job->body = body.p;
     job->bodyLen = body.len;
-    wcsncpy(job->model, g_model, 127);
-    wcsncpy(job->fallback, g_fallbackModel, 127);
     return job;
 }
 
@@ -1129,33 +1118,22 @@ static DWORD WINAPI TranscribeThread(LPVOID param)
 {
     Job *job = (Job *)param;
     JobResult *res = (JobResult *)calloc(1, sizeof *res);
-    const wchar_t *models[2];
-    int i, count = 0;
     char token[2048] = "";
     wchar_t project[128] = L"";
     DWORD start = GetTickCount(), t;
 
-    models[count++] = job->model;
-    if (job->fallback[0] && wcscmp(job->fallback, job->model)) models[count++] = job->fallback;
-    if (res && g_serviceAccount[0] && (res->error = GetAccessToken(g_serviceAccount, g_proxy, token, sizeof token, project, 128)) != NULL)
-        count = 0;
+    if (res && g_serviceAccount[0]) res->error = GetAccessToken(g_serviceAccount, g_proxy, token, sizeof token, project, 128);
     Log("generateContent: %u KB request (about %.1f s of audio), token %u ms", (unsigned)(job->bodyLen / 1024),
         job->bodyLen / (SAMPLE_RATE * 2 * 4 / 3.0), GetTickCount() - start);
 
-    for (i = 0; i < count && res; i++) {
+    if (res && !res->error) {
         Buf resp = { 0 };
         DWORD winErr, status;
         t = GetTickCount();
-        status = GeminiPost(models[i], g_serviceAccount[0] ? token : NULL, project, job->body, job->bodyLen, &resp, &winErr);
-        {
-            char *m = WideToUtf8(models[i]);
-            Log("  %s: HTTP %u, %u ms, tokens in %d / thinking %d / out %d", m ? m : "", status, GetTickCount() - t,
-                JsonInt(resp.p, "promptTokenCount"), JsonInt(resp.p, "thoughtsTokenCount"), JsonInt(resp.p, "candidatesTokenCount"));
-            if (status != 200 && resp.p) Log("    %.300s", resp.p);
-            free(m);
-        }
-        free(res->error);
-        res->error = NULL;
+        status = GeminiPost(REST_MODEL, g_serviceAccount[0] ? token : NULL, project, job->body, job->bodyLen, &resp, &winErr);
+        Log("  HTTP %u, %u ms, tokens in %d / thinking %d / out %d", status, GetTickCount() - t,
+            JsonInt(resp.p, "promptTokenCount"), JsonInt(resp.p, "thoughtsTokenCount"), JsonInt(resp.p, "candidatesTokenCount"));
+        if (status != 200 && resp.p) Log("    %.300s", resp.p);
 
         if (status == 200 && resp.p) {
             // Join the text of every part in candidates
@@ -1163,16 +1141,9 @@ static DWORD WINAPI TranscribeThread(LPVOID param)
             const char *p = strstr(resp.p, "\"candidates\"");
             while (p && (p = JsonNextString(p, "text", &text)) != NULL) { }
             res->text = Utf8ToWide(text.p ? text.p : "");
-            res->fallback = job->liveFailed || i > 0;
             free(text.p);
-            free(resp.p);
-            break;
-        }
-
-        if (status == 0) {
+        } else if (status == 0) {
             res->error = Fmt(L"Can't reach Gemini (check network or proxy settings)%ls [%u]", L"", winErr);
-            free(resp.p);
-            break; // another model won't help with a network problem
         } else {
             Buf msg = { 0 };
             wchar_t *wmsg;
@@ -1181,11 +1152,9 @@ static DWORD WINAPI TranscribeThread(LPVOID param)
             res->error = Fmt(L"Gemini error: %ls (HTTP %u)", wmsg ? wmsg : L"", status);
             free(wmsg);
             free(msg.p);
-            free(resp.p);
-            // Wrong key or no permission: another model won't help either
             if (status == 401) InvalidateToken();
-            if (status == 401 || status == 403) break;
         }
+        free(resp.p);
     }
 
     SecureZeroMemory(token, sizeof token);
@@ -1449,7 +1418,7 @@ static int LiveSendPcm(LiveSession *s, LONG gen, size_t *sent)
     }
 }
 
-// Ends the dictation and waits for the final transcript. A result without text means "fall back"
+// Ends the dictation and waits for the final transcript
 static JobResult *LiveFinish(LiveSession *s, int failed, size_t samples)
 {
     static const char end[] = "{\"realtimeInput\":{\"activityEnd\":{}}}";
@@ -1466,7 +1435,9 @@ static JobResult *LiveFinish(LiveSession *s, int failed, size_t samples)
         Log("live: transcript %u ms after activityEnd (%.1f s of audio)", GetTickCount() - t, samples / (double)SAMPLE_RATE);
     } else {
         const char *why = s && s->error[0] ? s->error : (failed ? "the session failed" : "timed out");
-        res->error = Utf8ToWide(why);
+        wchar_t *wwhy = Utf8ToWide(why);
+        res->error = Fmt(L"Live transcription failed: %ls", wwhy ? wwhy : L"", 0);
+        free(wwhy);
         Log("live: failed (%s)", why);
     }
     return res;
@@ -1700,7 +1671,7 @@ static void EndRecordingUi(void)
     KillTimer(g_main, TIMER_TICK);
 }
 
-static void StartRestJob(int liveFailed)
+static void StartRestJob(void)
 {
     Job *job = BuildJob();
     if (!job) {
@@ -1709,7 +1680,6 @@ static void StartRestJob(int liveFailed)
         HideLater(3000);
         return;
     }
-    job->liveFailed = liveFailed;
     CloseHandle(CreateThread(NULL, 0, TranscribeThread, job, 0, NULL));
 }
 
@@ -1730,11 +1700,11 @@ static void FinishRecording(void)
     ShowOverlay(L"… Transcribing", 0);
     if (g_useLive) {
         g_waitLive = 1;
-        // In case the live thread is stuck (e.g. a dead connection), fall back on our own
+        // In case the live thread is stuck (e.g. a dead connection), give up on our own
         SetTimer(g_main, TIMER_LIVE_WATCHDOG, 30000 + (UINT)(g_pcmLen / SAMPLE_RATE) * 200, NULL);
         LiveSetPhase(LIVE_FINISHING, 0);
     } else {
-        StartRestJob(0);
+        StartRestJob();
     }
 }
 
@@ -1801,7 +1771,7 @@ static void OnTranscribed(JobResult *res)
             // The text itself is the feedback: just get out of the way
             KillTimer(g_main, TIMER_HIDE);
             ShowWindow(g_overlay, SW_HIDE);
-            Log("pasted %u ms after stop%s", GetTickCount() - g_stopTick, res->fallback ? " (fallback)" : "");
+            Log("pasted %u ms after stop", GetTickCount() - g_stopTick);
         }
     }
     free(res->text);
@@ -1811,7 +1781,7 @@ static void OnTranscribed(JobResult *res)
 
 static void OnLiveDone(LONG gen, JobResult *res)
 {
-    if (!g_waitLive || gen != g_liveGen) { // late result after the watchdog already fell back
+    if (!g_waitLive || gen != g_liveGen) { // late result after the watchdog already gave up
         free(res->text);
         free(res->error);
         free(res);
@@ -1820,13 +1790,7 @@ static void OnLiveDone(LONG gen, JobResult *res)
     g_waitLive = 0;
     KillTimer(g_main, TIMER_LIVE_WATCHDOG);
     LiveSetPhase(LIVE_IDLE, 0);
-    if (res->text) {
-        OnTranscribed(res);
-        return;
-    }
-    free(res->error);
-    free(res);
-    StartRestJob(1);
+    OnTranscribed(res);
 }
 
 static void OnLiveWatchdog(void)
@@ -1834,9 +1798,11 @@ static void OnLiveWatchdog(void)
     KillTimer(g_main, TIMER_LIVE_WATCHDOG);
     if (!g_waitLive) return;
     g_waitLive = 0;
-    Log("live: no result in time, falling back to generateContent");
+    Log("live: no result in time");
     LiveSetPhase(LIVE_IDLE, 0);
-    StartRestJob(1);
+    g_state = ST_IDLE;
+    ShowOverlay(L"Transcription timed out", 1);
+    HideLater(6000);
 }
 
 // ---------------------------------------------------------------- Tray
