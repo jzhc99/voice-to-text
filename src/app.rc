@@ -1,2 +1,2 @@
-// 1 = main.c 里的 IDI_APP。资源管理器取 ID 最小的图标当 exe 图标
+// 1 = IDI_APP in main.c. Explorer uses the icon with the lowest ID as the exe icon
 1 ICON "app.ico"

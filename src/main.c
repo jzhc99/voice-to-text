@@ -378,12 +378,14 @@ static int JsonInt(const char *s, const char *key)
 // Appends a comma separated setting as a JSON string array; returns how many items were written
 static int JsonList(Buf *b, const wchar_t *csv)
 {
+    // Besides , and ; also splits on the fullwidth comma and semicolon and the ideographic comma (Chinese IME input)
+    static const wchar_t seps[] = L",\xFF0C;\xFF1B\x3001";
     wchar_t item[512];
     int n = 0;
     while (*csv) {
         size_t len = 0;
-        while (*csv && wcschr(L",，;；、", *csv)) csv++;
-        while (csv[len] && !wcschr(L",，;；、", csv[len])) len++;
+        while (*csv && wcschr(seps, *csv)) csv++;
+        while (csv[len] && !wcschr(seps, csv[len])) len++;
         if (len == 0) break;
         if (len > 511) len = 511;
         wcsncpy(item, csv, len);
@@ -401,10 +403,11 @@ static int JsonList(Buf *b, const wchar_t *csv)
 
 // ---------------------------------------------------------------- Settings
 
+// The \x escapes are the Chinese filler words "en", "a" and "nage"
 static const wchar_t DEFAULT_PROMPT[] =
     L"Transcribe this recording word for word. Write Chinese in Simplified Chinese. Keep English words, terms, product "
     L"names and abbreviations in English exactly as spoken; do not translate them. Add proper punctuation. Remove filler "
-    L"words (嗯, 啊, 那个, um, uh) and obvious stutters or repetitions. Do not summarize, rephrase, or answer questions "
+    L"words (\x55EF, \x554A, \x90A3\x4E2A, um, uh) and obvious stutters or repetitions. Do not summarize, rephrase, or answer questions "
     L"in the recording. Output only the transcribed text, with no explanations. If nobody speaks, output nothing.";
 
 static void WriteDefaultIni(const wchar_t *path)
