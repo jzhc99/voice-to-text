@@ -1,0 +1,2 @@
+// 1 = main.c 里的 IDI_APP。资源管理器取 ID 最小的图标当 exe 图标
+1 ICON "app.ico"
